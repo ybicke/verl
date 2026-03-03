@@ -154,7 +154,13 @@ class SGLangHttpServer:
             "dtype": self.config.dtype,
             "mem_fraction_static": self.config.gpu_memory_utilization,
             "disable_cuda_graph": self.config.enforce_eager,
-            "enable_memory_saver": True,
+            # Fix: H100 MIG slices don't support CUDA VMM (cu_mem_create → error 2).
+            # enable_memory_saver=True crashes SGLang at startup on MIG → ActorDiedError
+            # at wake_up(). Detect MIG from device name; disable on MIG slices.
+            # Full H100 (non-MIG) keeps True for efficient FSDP/SGLang GPU time-sharing.
+            "enable_memory_saver": (self.rollout_mode == RolloutMode.HYBRID) and (
+                "MIG" not in torch.cuda.get_device_properties(0).name.upper()
+            ),
             "base_gpu_id": 0,
             "gpu_id_step": 1,
             "tp_size": self.config.tensor_model_parallel_size,
