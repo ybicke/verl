@@ -196,6 +196,25 @@ class ServerAdapter(BaseRollout):
             - Main logic: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L452
             - runtime envs: https://github.com/THUDM/slime/blob/fb7605cc5fb09af0f9369d37f7192f12bddee577/slime/ray/ppo_actor.py#L39
         """
+        # Fix: when base_sync_done=True, FSDP sends raw LoRA adapter weights (lora_A.weight,
+        # lora_B.weight). SGLang's base model has no LoRA layers and cannot accept these keys
+        # → KeyError in gemma2.load_weights(). vLLM handles this via add_lora(), but SGLang
+        # has no equivalent API. Skip the LoRA-only update; SGLang continues to use the base
+        # model weights loaded on first wake_up() (CUDA VMM shared with FSDP). Rollout
+        # inference does not reflect the current LoRA delta (off-policy), but the pipeline
+        # runs correctly end-to-end. Proper fix: merge LoRA into base weights on FSDP side
+        # before calling update_weights. (verl issue #4065, see docs/debug_session.md)
+        peft_config = kwargs.get("peft_config", None)
+        base_sync_done = kwargs.get("base_sync_done", False)
+        if peft_config is not None and base_sync_done:
+            logger.warning(
+                "SGLang update_weights: skipping LoRA adapter weight sync (SGLang base model "
+                "has no LoRA layers). SGLang will infer with base model weights from CUDA VMM."
+            )
+            if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                await self._engine.flush_cache()
+            return
+
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._init_server_adapter()
 
