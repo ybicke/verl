@@ -205,7 +205,15 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=agent_data.metrics,
             extra_fields={},
         )
-        output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        output.extra_fields.update({
+            "turn_scores": agent_data.turn_scores,
+            "tool_rewards": agent_data.tool_rewards,
+            # Fix: NaiveRewardManager reads non_tensor_batch.get("reward_scores", {}).
+            # ToolAgentLoop only sets "turn_scores", so reward_scores is always empty
+            # → compute_score sees no pre-computed rewards → NotImplementedError.
+            # Add "reward_scores" as an alias so NaiveRewardManager finds the scores.
+            "reward_scores": agent_data.turn_scores,
+        })
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
