@@ -42,6 +42,34 @@ from verl.workers.rollout.utils import is_valid_ipv6_address
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# Fix: Ray actors have random multiprocessing authkeys, so ForkingPickler's
+# rebuild_storage_fd path fails with AuthenticationError for both CUDA and CPU
+# tensors. Regular pickle.Pickler produces _rebuild_tensor_v2 (data inline, no
+# IPC file descriptors, no authkey required). SGLang's SafeUnpickler allows
+# torch.* so server-side deserialization succeeds. (verl issue #4065)
+import io as _io
+import pickle as _pickle
+
+
+def _safe_mps_serialize(obj, output_str: bool = False):
+    buf = _io.BytesIO()
+    _pickle.Pickler(buf).dump(obj)
+    result = buf.getvalue()
+    if output_str:
+        import base64
+        return base64.b64encode(result).decode()
+    return result
+
+
+try:
+    try:
+        from sglang.srt.utils.common import MultiprocessingSerializer as _MPS
+    except ImportError:
+        from sglang.srt.utils import MultiprocessingSerializer as _MPS
+    _MPS.serialize = staticmethod(_safe_mps_serialize)
+except Exception as _e:
+    logger.warning(f"Could not patch MultiprocessingSerializer.serialize: {_e}")
+
 
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
 def _set_envs_and_config(server_args: ServerArgs):
@@ -185,9 +213,18 @@ class ServerAdapter(BaseRollout):
             weights = weights
 
         for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+            # Strip ".base_layer": verl's replace_lora_wrapper adds ".base_layer.weight"
+            # to LoRA target module keys (e.g. "qkv_proj.base_layer.weight"), but SGLang's
+            # base model uses standard HF names ("qkv_proj.weight") → KeyError in SGLang
+            # scheduler. LoRA adapter keys (lora_A.weight etc.) don't contain ".base_layer"
+            # so replace() is a no-op for them. (verl issue #4065)
+            cpu_batch = [
+                (name.replace(".base_layer", ""), t.detach().cpu() if isinstance(t, torch.Tensor) else t)
+                for name, t in params_batch
+            ]
             await sgl_update_weights(
                 engine=self._engine,
-                params_batch=params_batch,
+                params_batch=cpu_batch,
                 device_mesh_key="infer_tp",
                 device_mesh=self.device_mesh,
             )
